@@ -29,14 +29,14 @@ if [[ ! -x "${CLANG_DIR}/bin/clang" ]]; then
     echo "=== [1/6] 下载 AOSP Clang 18 (clang-r510928) via git sparse-checkout ==="
     CLANG_REPO="${WORKDIR}/clang_repo"
     rm -rf "$CLANG_REPO" "$CLANG_DIR"
-    git clone --depth=1 --filter=blob:none --no-checkout \
+    git clone --depth=1 --filter=blob:none --no-checkout -b main \
         https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
         "$CLANG_REPO"
     (
         cd "$CLANG_REPO"
         git sparse-checkout init --cone
         git sparse-checkout set clang-r510928
-        git checkout
+        git checkout main
     )
     ls -la "$CLANG_REPO"
     mv "${CLANG_REPO}/clang-r510928" "$CLANG_DIR"
