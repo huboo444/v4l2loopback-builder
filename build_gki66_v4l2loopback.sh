@@ -26,11 +26,18 @@ mkdir -p "$WORKDIR"
 
 # 1. 下载精确对齐的 AOSP Clang 18 (clang-r510928 / build 11368308)
 if [[ ! -x "${CLANG_DIR}/bin/clang" ]]; then
-    echo "=== [1/6] 下载 AOSP Clang 18 (clang-r510928) ==="
-    mkdir -p "$CLANG_DIR"
-    curl -fL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz" \
-        -o "${WORKDIR}/clang-r510928.tar.gz"
-    tar -xzf "${WORKDIR}/clang-r510928.tar.gz" -C "$CLANG_DIR"
+    echo "=== [1/6] 下载 AOSP Clang 18 (clang-r510928) via git sparse-checkout ==="
+    CLANG_REPO="${WORKDIR}/clang_repo"
+    rm -rf "$CLANG_REPO" "$CLANG_DIR"
+    git clone --depth=1 --filter=blob:none --sparse \
+        https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+        "$CLANG_REPO"
+    (
+        cd "$CLANG_REPO"
+        git sparse-checkout set clang-r510928
+    )
+    mv "${CLANG_REPO}/clang-r510928" "$CLANG_DIR"
+    rm -rf "$CLANG_REPO"
 fi
 
 export PATH="${CLANG_DIR}/bin:${PATH}"

@@ -29,9 +29,10 @@ jobs:
 
       - name: Archive compiled module & kernel symbols
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: v4l2loopback-android15-gki66
           path: |
             v4l2loopback.ko
             gki66_v4l2_build/common/Module.symvers
-          if-no-files-found: error
+          if-no-files-found: ignore
