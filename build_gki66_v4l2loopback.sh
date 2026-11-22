@@ -143,39 +143,37 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" olddefconfig
 
-# 4. 第一阶段：编译 vmlinux.o（产出全部内建目标与导出符号元数据，完全不触发 pahole）
-echo "=== [5/6] 构建 vmlinux.o 并通过 modpost 生成 vmlinux.symvers（保留 BTF ABI，跳过 pahole） ==="
-make "${MAKE_ARGS[@]}" vmlinux.o
+# 2. 受控构建 vmlinux：获取完整 vmlinux.symvers，显式捕获末端旧版 pahole/BTFIDS 退出码
+echo "=== [5/6] 受控构建 vmlinux 以生成 vmlinux.symvers（保留 BTF ABI，忽略末端旧版 BTFIDS 错误） ==="
+VMLINUX_RC=0
+make "${MAKE_ARGS[@]}" vmlinux || VMLINUX_RC=$?
+echo "[INFO] make vmlinux 结束，退出码=${VMLINUX_RC}（若为末端 BTFIDS 导致非零属预期，下面执行强后置断言）"
 
-# 第二阶段：触发 MODPOST 生成 vmlinux.symvers（含防御回退，绝不因最终 BTFIDS 中断）
+# 3. 强后置契约断言：文件必须非空且包含完整内核导出表（大于等于 1000 行）
 if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
-    echo "[INFO] 执行顶级 modpost 生成 vmlinux.symvers..."
-    make "${MAKE_ARGS[@]}" modpost || true
-fi
-if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
-    echo "[WARN] modpost 未直接产出 symvers，启用受控回退（产出 vmlinux.symvers 后忽略末端 BTFIDS 错误）..."
-    make "${MAKE_ARGS[@]}" vmlinux || true
-fi
-
-# 关键防坑：确保不存在残缺 vmlinux，使后续外部模块构建干净跳过旧版 pahole BTF 生成
-rm -f "${KERNEL_DIR}/vmlinux"
-
-# 串行补齐外置模块骨架（生成 arm64 scripts/module.lds 与必需头文件，约 1 秒）
-make "${MAKE_ARGS[@]}" modules_prepare
-
-# 强断言 vmlinux.symvers 非空并注入 Module.symvers
-if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
-    echo "[ERROR] 未能生成非空 vmlinux.symvers，中止构建！" >&2
-    ls -la "${KERNEL_DIR}"/*.symvers 2>/dev/null >&2 || true
+    echo "[ERROR] 未能生成非空 vmlinux.symvers！说明在 MODPOST 之前发生了真实编译错误，请回溯上方日志。" >&2
     exit 4
 fi
+
+SYMVERS_LINES=$(wc -l < "${KERNEL_DIR}/vmlinux.symvers")
+echo "[INFO] vmlinux.symvers 已生成，导出符号总数=${SYMVERS_LINES}"
+if (( SYMVERS_LINES < 1000 )); then
+    echo "[ERROR] vmlinux.symvers 符号数异常偏少 (${SYMVERS_LINES})，疑似残缺文件，熔断中止！" >&2
+    exit 4
+fi
+
+# 4. 强删残缺 vmlinux 与 .tmp_vmlinux*（释放磁盘并锁死外部模块跳过旧版 pahole 分支）
+rm -f "${KERNEL_DIR}/vmlinux" "${KERNEL_DIR}"/.tmp_vmlinux*
+
+# 5. 串行补齐外部模块构建骨架（生成 arm64 scripts/module.lds 等必需文件，约 1 秒）
+make "${MAKE_ARGS[@]}" modules_prepare
 cp "${KERNEL_DIR}/vmlinux.symvers" "${KERNEL_DIR}/Module.symvers"
 
-# 黄金锚点 Fail-Fast 熔断（0x4e276f37 + V4L2 核心 T 型符号完备性）
+# 6. 黄金锚点 Fail-Fast 熔断（0x4e276f37 + 4 项内建 V4L2 核心符号完备性）
 BUILT_CRC=$(awk '$2 == "module_layout" {print $1; exit}' "${KERNEL_DIR}/Module.symvers" || true)
 echo "[CHECK] built module_layout = ${BUILT_CRC:-MISSING} (device baseline = ${EXPECTED_LAYOUT_CRC})"
 if [[ "${BUILT_CRC,,}" != "${EXPECTED_LAYOUT_CRC,,}" ]]; then
-    echo "[ABORT] module_layout CRC 偏移！说明内核源码树或配置存在差异，已熔断！" >&2
+    echo "[ABORT] module_layout CRC 偏移！严禁继续，熔断中止。" >&2
     exit 5
 fi
 
@@ -185,14 +183,14 @@ for req_sym in __video_register_device video_unregister_device video_ioctl2 v4l2
         exit 6
     fi
 done
-echo "[PASS] module_layout (${EXPECTED_LAYOUT_CRC}) 与 V4L2 核心内建符号 100% 就位！"
+echo "[PASS] module_layout (${EXPECTED_LAYOUT_CRC}) 与 V4L2 核心内建符号 100% 比特级对齐！"
 
-# 5. 编译 v4l2loopback.ko 并执行零 Panic 门禁校验
-echo "=== [6/6] 编译 v4l2loopback.ko 并执行零 Panic 门禁校验 ==="
+# 7. 编译 v4l2loopback.ko（预期打印 Skipping BTF generation 并成功产出）+ 零 Panic ELF ABI 门禁
+echo "=== [6/6] 编译 v4l2loopback.ko 并执行零 Panic ELF 门禁校验 ==="
 make "${MAKE_ARGS[@]}" KCFLAGS="-Wno-error" M="$V4L2_DIR" modules
 cp "${V4L2_DIR}/v4l2loopback.ko" ./v4l2loopback.ko
 
-# 导出未定义符号清单（供上机前核验）+ 执行零 Panic 门禁
+# 导出未定义符号清单供平板上机前二次核验
 llvm-nm -u ./v4l2loopback.ko | awk '{print $2}' | sort -u > ./v4l2loopback_needed_syms.txt
 python3 verify_ko_abi.py gate --baseline kmi_baseline.json --ko ./v4l2loopback.ko --json | tee gate_report.json
 python3 verify_ko_abi.py gate --baseline kmi_baseline.json --ko ./v4l2loopback.ko
