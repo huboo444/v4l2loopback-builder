@@ -143,30 +143,30 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" olddefconfig
 
-# 4. 按 BTF_MODULES 自适应选择零冗余主构建目标（严禁与 modules_prepare 混在同一并行调用）
-echo "=== [5/6] 自适应构建符号表并校验 module_layout 黄金锚点 (${EXPECTED_LAYOUT_CRC}) ==="
-if grep -q '^CONFIG_DEBUG_INFO_BTF_MODULES=y' "${KERNEL_DIR}/.config"; then
-    command -v pahole >/dev/null 2>&1 || { echo "[ERROR] 缺少 pahole (dwarves)" >&2; exit 3; }
-    echo "[INFO] 检测到 CONFIG_DEBUG_INFO_BTF_MODULES=y，构建 vmlinux（供外置模块 Split BTF 基底）..."
-    make "${MAKE_ARGS[@]}" vmlinux
-else
-    echo "[INFO] 未启用 BTF_MODULES，走极速路径构建 vmlinux.o..."
-    make "${MAKE_ARGS[@]}" vmlinux.o
-fi
+# 4. 第一阶段：编译 vmlinux.o（产出全部内建目标与导出符号元数据，完全不触发 pahole）
+echo "=== [5/6] 构建 vmlinux.o 并通过 modpost 生成 vmlinux.symvers（保留 BTF ABI，跳过 pahole） ==="
+make "${MAKE_ARGS[@]}" vmlinux.o
 
-# 兜底触发顶级 modpost 目标生成 vmlinux.symvers（仅针对 vmlinux.o，不编译任何 in-tree 模块）
+# 第二阶段：触发 MODPOST 生成 vmlinux.symvers（含防御回退，绝不因最终 BTFIDS 中断）
 if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
-    echo "[INFO] 触发顶级 modpost 生成 vmlinux.symvers..."
-    make "${MAKE_ARGS[@]}" modpost
+    echo "[INFO] 执行顶级 modpost 生成 vmlinux.symvers..."
+    make "${MAKE_ARGS[@]}" modpost || true
+fi
+if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
+    echo "[WARN] modpost 未直接产出 symvers，启用受控回退（产出 vmlinux.symvers 后忽略末端 BTFIDS 错误）..."
+    make "${MAKE_ARGS[@]}" vmlinux || true
 fi
 
-# 串行补齐外置模块骨架（确保 arm64 scripts/module.lds 与生成头文件完备，耗时约 1 秒）
+# 关键防坑：确保不存在残缺 vmlinux，使后续外部模块构建干净跳过旧版 pahole BTF 生成
+rm -f "${KERNEL_DIR}/vmlinux"
+
+# 串行补齐外置模块骨架（生成 arm64 scripts/module.lds 与必需头文件，约 1 秒）
 make "${MAKE_ARGS[@]}" modules_prepare
 
-# 校验 vmlinux.symvers 并注入 Module.symvers
+# 强断言 vmlinux.symvers 非空并注入 Module.symvers
 if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
-    echo "[ERROR] 未能生成非空 vmlinux.symvers！目录现状：" >&2
-    ls -la "${KERNEL_DIR}"/*.symvers "${KERNEL_DIR}"/vmlinux* 2>/dev/null >&2 || true
+    echo "[ERROR] 未能生成非空 vmlinux.symvers，中止构建！" >&2
+    ls -la "${KERNEL_DIR}"/*.symvers 2>/dev/null >&2 || true
     exit 4
 fi
 cp "${KERNEL_DIR}/vmlinux.symvers" "${KERNEL_DIR}/Module.symvers"
