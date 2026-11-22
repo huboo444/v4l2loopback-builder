@@ -143,26 +143,49 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" olddefconfig
 
-# 4. 按 BTF_MODULES 自适应构建目标并执行 0x4e276f37 熔断
+# 4. 按 BTF_MODULES 自适应选择零冗余主构建目标（严禁与 modules_prepare 混在同一并行调用）
 echo "=== [5/6] 自适应构建符号表并校验 module_layout 黄金锚点 (${EXPECTED_LAYOUT_CRC}) ==="
 if grep -q '^CONFIG_DEBUG_INFO_BTF_MODULES=y' "${KERNEL_DIR}/.config"; then
     command -v pahole >/dev/null 2>&1 || { echo "[ERROR] 缺少 pahole (dwarves)" >&2; exit 3; }
-    echo "[INFO] 检测到 CONFIG_DEBUG_INFO_BTF_MODULES=y，构建 vmlinux + vmlinux.symvers..."
-    make "${MAKE_ARGS[@]}" modules_prepare vmlinux vmlinux.symvers
+    echo "[INFO] 检测到 CONFIG_DEBUG_INFO_BTF_MODULES=y，构建 vmlinux（供外置模块 Split BTF 基底）..."
+    make "${MAKE_ARGS[@]}" vmlinux
 else
-    echo "[INFO] 未启用 BTF_MODULES，走极速路径 modules_prepare + vmlinux.symvers..."
-    make "${MAKE_ARGS[@]}" modules_prepare vmlinux.symvers
+    echo "[INFO] 未启用 BTF_MODULES，走极速路径构建 vmlinux.o..."
+    make "${MAKE_ARGS[@]}" vmlinux.o
 fi
 
+# 兜底触发顶级 modpost 目标生成 vmlinux.symvers（仅针对 vmlinux.o，不编译任何 in-tree 模块）
+if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
+    echo "[INFO] 触发顶级 modpost 生成 vmlinux.symvers..."
+    make "${MAKE_ARGS[@]}" modpost
+fi
+
+# 串行补齐外置模块骨架（确保 arm64 scripts/module.lds 与生成头文件完备，耗时约 1 秒）
+make "${MAKE_ARGS[@]}" modules_prepare
+
+# 校验 vmlinux.symvers 并注入 Module.symvers
+if [[ ! -s "${KERNEL_DIR}/vmlinux.symvers" ]]; then
+    echo "[ERROR] 未能生成非空 vmlinux.symvers！目录现状：" >&2
+    ls -la "${KERNEL_DIR}"/*.symvers "${KERNEL_DIR}"/vmlinux* 2>/dev/null >&2 || true
+    exit 4
+fi
 cp "${KERNEL_DIR}/vmlinux.symvers" "${KERNEL_DIR}/Module.symvers"
 
+# 黄金锚点 Fail-Fast 熔断（0x4e276f37 + V4L2 核心 T 型符号完备性）
 BUILT_CRC=$(awk '$2 == "module_layout" {print $1; exit}' "${KERNEL_DIR}/Module.symvers" || true)
 echo "[CHECK] built module_layout = ${BUILT_CRC:-MISSING} (device baseline = ${EXPECTED_LAYOUT_CRC})"
 if [[ "${BUILT_CRC,,}" != "${EXPECTED_LAYOUT_CRC,,}" ]]; then
     echo "[ABORT] module_layout CRC 偏移！说明内核源码树或配置存在差异，已熔断！" >&2
-    exit 4
+    exit 5
 fi
-echo "[PASS] module_layout 黄金锚点 100% 比特级对齐！"
+
+for req_sym in __video_register_device video_unregister_device video_ioctl2 v4l2_device_register; do
+    if ! awk -v s="$req_sym" '$2 == s {found=1; exit} END {exit !found}' "${KERNEL_DIR}/Module.symvers"; then
+        echo "[ABORT] Module.symvers 缺失内建 V4L2 核心符号: ${req_sym}" >&2
+        exit 6
+    fi
+done
+echo "[PASS] module_layout (${EXPECTED_LAYOUT_CRC}) 与 V4L2 核心内建符号 100% 就位！"
 
 # 5. 编译 v4l2loopback.ko 并执行零 Panic 门禁校验
 echo "=== [6/6] 编译 v4l2loopback.ko 并执行零 Panic 门禁校验 ==="
