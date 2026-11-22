@@ -11,23 +11,90 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Free runner disk space (Prevent ThinLTO Disk Full)
+      - name: 释放 Runner 磁盘空间并动态补齐 8GiB Swap（防 ETXTBSY 与爆盘）
         run: |
-          echo "=== 释放 Runner 磁盘空间 ==="
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          df -h
+          set -euo pipefail
 
-      - name: Mount 8GB Swap (Prevent ThinLTO OOM)
-        run: |
-          echo "=== 挂载 8GB Swap ==="
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
+          echo "=== [1/2] 释放 Runner 预装冗余工具链磁盘空间 ==="
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /mnt 2>/dev/null || df -h /
+
+          ensure_ci_swap() {
+              local target_mb="${1:-8192}"
+              local min_build_free_mb="${2:-20480}"
+
+              # 1. 从 /proc/swaps 精确统计当前所有活跃 Swap 总量（MiB）
+              local current_mb
+              current_mb=$(awk 'NR>1 {sum+=$3} END {print int(sum/1024)}' /proc/swaps 2>/dev/null || echo 0)
+              echo "[INFO] 当前活跃 Swap=${current_mb} MiB, 目标总 Swap=${target_mb} MiB"
+
+              if (( current_mb >= target_mb )); then
+                  echo "[PASS] 现有 Swap 已满足要求，跳过增量分配"
+                  return 0
+              fi
+
+              local deficit_mb=$(( target_mb - current_mb ))
+              # 向下保护：至少分配 512 MiB，避免零碎小文件
+              (( deficit_mb < 512 )) && deficit_mb=512
+
+              # 2. 路由最优挂载目录：优先使用独立临时盘 /mnt，保护 / 编译空间
+              local swap_dir="/"
+              local root_dev mnt_dev mnt_free_mb root_free_mb
+              root_dev=$(stat -c '%d' /)
+              mnt_dev=$(stat -c '%d' /mnt 2>/dev/null || echo "$root_dev")
+              root_free_mb=$(df -Pm / | awk 'NR==2 {print $4}')
+
+              if [[ -d /mnt && "$mnt_dev" != "$root_dev" ]]; then
+                  mnt_free_mb=$(df -Pm /mnt | awk 'NR==2 {print $4}')
+                  if (( mnt_free_mb > deficit_mb + 2048 )); then
+                      swap_dir="/mnt"
+                  fi
+              fi
+
+              if [[ "$swap_dir" == "/" ]] && (( root_free_mb - deficit_mb < min_build_free_mb )); then
+                  echo "[ERROR] 根分区剩余空间不足（当前=${root_free_mb}MiB, 需分配=${deficit_mb}MiB, 编译保底=${min_build_free_mb}MiB）" >&2
+                  return 1
+              fi
+
+              local swap_file="${swap_dir%/}/ci_extra.swap"
+              echo "[INFO] 将在 ${swap_file} 增量分配 ${deficit_mb} MiB Swap（不触碰系统原有 /swapfile）"
+
+              # 3. 仅对自身专属文件做幂等清理
+              if grep -qF "$swap_file" /proc/swaps 2>/dev/null; then
+                  sudo swapoff "$swap_file"
+              fi
+              sudo rm -f "$swap_file"
+
+              # 4. 优先 fallocate，若底层 FS 拒绝或 swapon 报空洞则自动回退 dd 实写
+              local mounted=0
+              if sudo fallocate -l "${deficit_mb}M" "$swap_file" 2>/dev/null; then
+                  sudo chmod 600 "$swap_file"
+                  if sudo mkswap "$swap_file" >/dev/null && sudo swapon "$swap_file" 2>/dev/null; then
+                      mounted=1
+                  else
+                      echo "[WARN] fallocate 产物被 swapon 拒绝，自动回退至 dd 实写清零分配..."
+                      sudo rm -f "$swap_file"
+                  fi
+              fi
+
+              if [[ "$mounted" -eq 0 ]]; then
+                  sudo dd if=/dev/zero of="$swap_file" bs=1M count="$deficit_mb" status=none
+                  sudo chmod 600 "$swap_file"
+                  sudo mkswap "$swap_file" >/dev/null
+                  sudo swapon "$swap_file"
+              fi
+
+              # 5. 最终强断言验证
+              local final_mb
+              final_mb=$(awk 'NR>1 {sum+=$3} END {print int(sum/1024)}' /proc/swaps)
+              echo "[PASS] 增量 Swap 挂载成功: ${swap_file} (+${deficit_mb} MiB), 当前总 Swap=${final_mb} MiB"
+              swapon --show
+              free -h
+              df -h / /mnt 2>/dev/null || df -h /
+          }
+
+          echo "=== [2/2] 执行动态差额 Swap 补齐 ==="
+          ensure_ci_swap 8192 20480
 
       - name: Checkout repository
         uses: actions/checkout@v4
