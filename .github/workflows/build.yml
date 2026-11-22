@@ -1,0 +1,37 @@
+name: Build v4l2loopback (Android 15 GKI 6.6.50)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-and-verify:
+    name: Cross-compile v4l2loopback & Gate ABI
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl bc bison flex libssl-dev libelf-dev dwarves cpio rsync zstd python3 make gcc-aarch64-linux-gnu
+
+      - name: Prepare execution permissions
+        run: |
+          chmod +x build_gki66_v4l2loopback.sh verify_ko_abi.py
+
+      - name: Execute build & zero-panic ABI gate
+        run: |
+          ./build_gki66_v4l2loopback.sh
+
+      - name: Archive compiled module & kernel symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4l2loopback-android15-gki66
+          path: |
+            v4l2loopback.ko
+            gki66_v4l2_build/common/Module.symvers
+          if-no-files-found: error
