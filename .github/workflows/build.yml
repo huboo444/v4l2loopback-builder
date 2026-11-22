@@ -11,13 +11,31 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: Free runner disk space (Prevent ThinLTO Disk Full)
+        run: |
+          echo "=== 释放 Runner 磁盘空间 ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Mount 8GB Swap (Prevent ThinLTO OOM)
+        run: |
+          echo "=== 挂载 8GB Swap ==="
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl bc bison flex libssl-dev libelf-dev dwarves cpio rsync zstd python3 make gcc-aarch64-linux-gnu
+          sudo apt-get install -y git curl bc bison flex libssl-dev libelf-dev dwarves cpio rsync zstd python3 make
 
       - name: Prepare execution permissions
         run: |
@@ -27,12 +45,14 @@ jobs:
         run: |
           ./build_gki66_v4l2loopback.sh
 
-      - name: Archive compiled module & kernel symbols
+      - name: Archive compiled module & verification reports
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: v4l2loopback-android15-gki66
           path: |
             v4l2loopback.ko
+            gate_report.json
+            v4l2loopback_needed_syms.txt
             gki66_v4l2_build/common/Module.symvers
           if-no-files-found: ignore
